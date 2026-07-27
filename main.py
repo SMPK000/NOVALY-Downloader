@@ -35,14 +35,12 @@ from telegram.error import TelegramError, Forbidden
 
 
 # --- Configuration & Constants ---
-BOT_TOKEN = "BOT_TOKEN_HERE"
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Owner and Admin IDs
-OWNER_ID = 123456789  # Replace with your actual Telegram user ID
-ADMIN_IDS = [123456789, 987654321]  # Replace with actual admin user IDs
-
+OWNER_ID = int(os.getenv("OWNER_ID"))  # Replace with your actual Telegram user ID
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS").split(",")))
 # Bot Settings
-SUPPORT_CONTACT = "@FairyRoot"
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT")
 DOWNLOAD_DIR = "bot_downloads"
 
 # User Roles
