@@ -74,6 +74,7 @@ PERSISTENCE_FILE = os.getenv(
     os.path.join(DATA_DIR, "bot_persistence.pickle") if DATA_DIR else "bot_persistence.pickle",
 )
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+YTDLP_COOKIES_DIR = os.getenv("YTDLP_COOKIES_DIR", "/etc/secrets").strip()
 
 ROLE_ADMIN = "admin"
 ROLE_PREMIUM = "premium"
@@ -205,21 +206,67 @@ def _yt_dlp_signin_hint(error_text: str) -> bool:
     ))
 
 
-def _build_ytdlp_common_opts(url: str) -> Dict[str, Any]:
+def _cookie_files_for_url(url: str) -> List[str]:
+    """Return usable cookie files, preferring one complete browser export.
+
+    A single browser-exported cookies.txt can contain cookies for many domains,
+    so it is the preferred file. Additional files in Render Secret Files or
+    YTDLP_COOKIES_DIR are treated as fallbacks for platform-specific sessions.
+    """
+    candidates: List[str] = []
+
+    def add(path: str) -> None:
+        path = os.path.abspath(os.path.expanduser(path.strip())) if path else ""
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0 and path not in candidates:
+            candidates.append(path)
+
+    add(YTDLP_COOKIES_FILE)
+
+    # Common Render Secret File names. Keep this broad so the same deployment
+    # can support YouTube, Instagram, TikTok, Facebook, X, Reddit, etc.
+    common_names = [
+        "cookies.txt", "youtube_cookies.txt", "instagram_cookies.txt",
+        "tiktok_cookies.txt", "facebook_cookies.txt", "x_cookies.txt",
+        "twitter_cookies.txt", "reddit_cookies.txt", "generic_cookies.txt",
+    ]
+    if YTDLP_COOKIES_DIR and os.path.isdir(YTDLP_COOKIES_DIR):
+        for name in common_names:
+            add(os.path.join(YTDLP_COOKIES_DIR, name))
+        try:
+            for name in sorted(os.listdir(YTDLP_COOKIES_DIR)):
+                if name.lower().endswith((".txt", ".cookies")) and "cookie" in name.lower():
+                    add(os.path.join(YTDLP_COOKIES_DIR, name))
+        except OSError:
+            pass
+
+    # Also support local development and a project-level cookies.txt.
+    add("cookies.txt")
+    return candidates
+
+
+def _cookie_file_for_url(url: str) -> Optional[str]:
+    files = _cookie_files_for_url(url)
+    return files[0] if files else None
+
+
+def _build_ytdlp_common_opts(url: str, cookiefile: Optional[str] = None) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "useragent": USER_AGENT_YTDLP,
         "retries": MAX_RETRIES_YTDLP,
         "fragment_retries": MAX_RETRIES_YTDLP,
-        "socket_timeout": 30,
+        "socket_timeout": 45,
         "noplaylist": False,
+        "geo_bypass": True,
+        "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
     }
-    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
-        opts["cookiefile"] = YTDLP_COOKIES_FILE
-    # YouTube frequently changes which clients work without authentication.
-    # Cookies remain the reliable solution when YouTube presents an anti-bot challenge.
-    if any(host in url.lower() for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
+    if cookiefile and os.path.isfile(cookiefile):
+        opts["cookiefile"] = cookiefile
+    # Do not restrict normal URLs to a platform-specific extractor. yt-dlp's
+    # extractor registry + generic extractor handles a very broad range of sites.
+    lower_url = url.lower()
+    if any(host in lower_url for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
         opts["extractor_args"] = {
             "youtube": {
                 "player_client": ["web_safari", "android_vr", "web"],
@@ -274,146 +321,148 @@ async def fetch_http_content(
 def download_media_ytdlp(
     url: str, output_dir: str, format_choice: str = "video", user_id: int = 0
 ) -> Tuple[bool, str, Optional[str], Optional[Dict[str, Any]]]:
+    """Download media using yt-dlp with broad extractor + cookie fallback support."""
     os.makedirs(output_dir, exist_ok=True)
     unique_prefix = uuid4().hex[:8]
-    ydl_initial_info_opts = _build_ytdlp_common_opts(url)
-    try:
-        with yt_dlp.YoutubeDL(ydl_initial_info_opts) as ydl_info_fetch:
-            media_info = ydl_info_fetch.extract_info(url, download=False)
-        if not media_info:
-            return False, "Could not retrieve media information.", None, None
-    except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e)
-        err_msg_lower = err_msg.lower()
-        if "unsupported url" in err_msg_lower:
-            return False, "Invalid or unsupported URL.", None, None
-        if _yt_dlp_signin_hint(err_msg):
-            if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+    cookie_files = _cookie_files_for_url(url)
+    # Always try the complete browser export first, then platform-specific files,
+    # and finally a no-cookie attempt. This maximizes compatibility without
+    # requiring a separate code path for every platform yt-dlp supports.
+    cookie_attempts: List[Optional[str]] = cookie_files + [None]
+
+    media_info = None
+    last_error = ""
+    used_cookiefile = None
+    for cookiefile in cookie_attempts:
+        ydl_initial_info_opts = _build_ytdlp_common_opts(url, cookiefile)
+        try:
+            with yt_dlp.YoutubeDL(ydl_initial_info_opts) as ydl_info_fetch:
+                media_info = ydl_info_fetch.extract_info(url, download=False)
+            if media_info:
+                used_cookiefile = cookiefile
+                break
+        except yt_dlp.utils.DownloadError as e:
+            last_error = str(e)
+            print(
+                f"INFO: yt-dlp info attempt failed (cookie={'yes' if cookiefile else 'no'}) "
+                f"for {url} (User: {user_id}): {last_error}"
+            )
+            if "unsupported url" in last_error.lower():
+                return False, "Invalid or unsupported URL. yt-dlp does not recognize this link.", None, None
+        except Exception as e:
+            last_error = str(e)
+            print(f"INFO: yt-dlp info attempt exception for {url} (User: {user_id}): {e}")
+
+    if not media_info:
+        if _yt_dlp_signin_hint(last_error):
+            if cookie_files:
                 return (
                     False,
-                    "YouTube asked for sign-in confirmation. Refresh the cookies file on the server and restart the bot.",
+                    "The site requires authentication/anti-bot verification. The configured cookies.txt was tried but is expired, incomplete, or not valid for this site. Refresh/export a fresh browser cookies.txt and replace the Render Secret File.",
                     None,
                     None,
                 )
             return (
                 False,
-                "YouTube asked for sign-in confirmation. Add a valid cookies.txt file on the server and set YTDLP_COOKIES_FILE.",
+                "The site requires authentication/anti-bot verification. Add a fresh browser-exported cookies.txt as a Render Secret File named cookies.txt.",
                 None,
                 None,
             )
-        if "cookies" in err_msg_lower and "youtube" in err_msg_lower:
-            return (
-                False,
-                "YouTube needs cookies/authentication. Configure YTDLP_COOKIES_FILE with a valid cookies.txt file.",
-                None,
-                None,
-            )
-        return False, f"Error fetching media info: {e}", None, None
-    except Exception as e:
-        print(f"Unexpected YTDLP info error for {url} (User: {user_id}): {e}")
-        return False, f"Unexpected error fetching media info: {e}", None, None
+        return False, f"Error fetching media info: {last_error or 'unknown extractor error'}", None, None
 
     title = media_info.get("title", "media")
     sanitized_title = sanitize_filename(title)
     base_filename = f"{unique_prefix}_{sanitized_title}"
-    ydl_download_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "useragent": USER_AGENT_YTDLP,
-        "retries": MAX_RETRIES_YTDLP,
-        "fragment_retries": MAX_RETRIES_YTDLP,
+
+    ydl_download_opts: Dict[str, Any] = _build_ytdlp_common_opts(url, used_cookiefile)
+    ydl_download_opts.update({
+        "outtmpl": os.path.join(output_dir, f"{base_filename}.%(ext)s"),
         "retry_sleep_functions": {
             "http": lambda n: RETRY_DELAY_YTDLP,
             "fragment": lambda n: RETRY_DELAY_YTDLP,
         },
-        "outtmpl": os.path.join(output_dir, f"{base_filename}.%(ext)s"),
-    }
-    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-        ydl_download_opts["cookiefile"] = YTDLP_COOKIES_FILE
-    if "youtube.com" in url or "youtu.be" in url or "youtube-nocookie.com" in url:
-        ydl_download_opts.setdefault(
-            "extractor_args", {"youtube": {"player_client": ["android", "web"]}}
-        )
+    })
     if format_choice == "video":
+        # Prefer MP4-compatible streams but fall back to the best available media
+        # on sites whose formats do not expose MP4/M4A.
         ydl_download_opts["format"] = (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best"
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo+bestaudio/"
+            "best[ext=mp4]/best"
         )
         if FFMPEG_AVAILABLE:
             ydl_download_opts["merge_output_format"] = "mp4"
     elif format_choice == "audio":
         ydl_download_opts["format"] = "bestaudio/best"
+        if FFMPEG_AVAILABLE:
+            ydl_download_opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "m4a",
+            }]
+    else:
+        return False, "Invalid media format requested.", None, media_info
 
     predicted_path = None
     try:
         temp_sim_opts = ydl_download_opts.copy()
-        temp_sim_opts.update(
-            {"simulate": True, "skip_download": True, "quiet": True, "verbose": False}
-        )
+        temp_sim_opts.update({"simulate": True, "skip_download": True, "quiet": True, "verbose": False})
         with yt_dlp.YoutubeDL(temp_sim_opts) as ydl_sim:
             sim_info = ydl_sim.extract_info(url, download=False)
             if sim_info and sim_info.get("requested_downloads"):
-                predicted_path = sim_info["requested_downloads"][0]["filepath"]
+                predicted_path = sim_info["requested_downloads"][0].get("filepath")
             elif sim_info and sim_info.get("filename"):
                 predicted_path = sim_info["filename"]
-            else:
-                ext = media_info.get(
-                    "ext", "mp4" if format_choice == "video" else "m4a"
-                )
-                predicted_path = os.path.join(output_dir, f"{base_filename}.{ext}")
     except Exception as e_sim:
-        print(
-            f"WARNING: Filename prediction via simulation failed: {e_sim}. Using fallback."
-        )
-        ext = media_info.get("ext", "mp4" if format_choice == "video" else "m4a")
+        print(f"WARNING: Filename prediction failed: {e_sim}")
+
+    if not predicted_path:
+        ext = "mp4" if format_choice == "video" else ("m4a" if FFMPEG_AVAILABLE else media_info.get("ext", "m4a"))
         predicted_path = os.path.join(output_dir, f"{base_filename}.{ext}")
 
     hook_data = {"actual_path": None}
 
     def _hook(d):
-        if d["status"] == "finished":
-            hook_data["actual_path"] = d["filename"]
+        if d.get("status") == "finished":
+            hook_data["actual_path"] = d.get("filename")
 
-    ydl_download_opts.update(
-        {"progress_hooks": [_hook], "quiet": False, "verbose": False}
-    )
+    ydl_download_opts.update({"progress_hooks": [_hook], "quiet": False, "verbose": False})
 
     try:
         with yt_dlp.YoutubeDL(ydl_download_opts) as ydl:
             ydl.download([url])
-        final_path_to_check = None
-        actual_hook_path_val = hook_data["actual_path"]
-        if actual_hook_path_val and os.path.exists(actual_hook_path_val):
-            final_path_to_check = actual_hook_path_val
-        elif predicted_path and os.path.exists(predicted_path):
-            final_path_to_check = predicted_path
-        else:
-            possible_files = [
-                f for f in os.listdir(output_dir) if f.startswith(base_filename)
-            ]
-            if possible_files:
-                final_path_to_check = os.path.join(output_dir, possible_files[0])
-        if final_path_to_check and os.path.exists(final_path_to_check):
-            return True, "Download successful.", final_path_to_check, media_info
-        print(
-            f"ERROR: Download finished but final file not confirmed. Predicted='{predicted_path}', Hook='{actual_hook_path_val}'"
-        )
-        return (
-            False,
-            "Download completed, but final file path not confirmed.",
-            None,
-            media_info,
-        )
+
+        candidates = []
+        if hook_data["actual_path"]:
+            candidates.append(hook_data["actual_path"])
+        if predicted_path:
+            candidates.append(predicted_path)
+        try:
+            candidates.extend(
+                os.path.join(output_dir, f)
+                for f in os.listdir(output_dir)
+                if f.startswith(base_filename)
+            )
+        except OSError:
+            pass
+
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                return True, "Download successful.", candidate, media_info
+
+        return False, "Download completed, but the final media file could not be located.", None, media_info
     except yt_dlp.utils.DownloadError as e:
         err_msg = str(e)
         print(f"ERROR: YTDLP DownloadError for {url} (User: {user_id}): {err_msg}")
         if _yt_dlp_signin_hint(err_msg):
             return (
                 False,
-                "YouTube asked for sign-in confirmation. Add a valid cookies.txt file on the server and set YTDLP_COOKIES_FILE.",
+                "The site requested sign-in/anti-bot verification. Refresh the browser-exported cookies.txt used by NOVALY and try again.",
                 None,
                 media_info,
             )
-        return False, f"Failed to download: {e}", None, media_info
+        if "unsupported url" in err_msg.lower():
+            return False, "This URL is not supported by yt-dlp or the site does not expose downloadable media.", None, media_info
+        return False, f"Failed to download: {err_msg}", None, media_info
     except Exception as e:
         print(f"ERROR: Unexpected YTDLP error for {url} (User: {user_id}): {e}")
         return False, f"Unexpected download error: {type(e).__name__}", None, media_info
@@ -490,7 +539,7 @@ def check_and_update_daily_limit(
     ud.setdefault("daily_downloads_count", 0)
     if ud.get("last_download_date") != today:
         ud.update({"last_download_date": today, "daily_downloads_count": 0})
-    if ud.get("daily_downloads_count", 0) < STANDARD_USER_DAILY_DOWNLOADS:
+    if ud.get("daily_downloads_count", 0) < get_standard_daily_limit(context):
         ud["daily_downloads_count"] = ud.get("daily_downloads_count", 0) + 1
         return True
     return False
@@ -1121,7 +1170,9 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "Please send a valid media link to download."
             )
         return
-    url_to_process = found_urls[0].strip()
+    url_to_process = found_urls[0].strip().strip("<>\"")
+    # Telegram/user messages often put punctuation immediately after a URL.
+    url_to_process = url_to_process.rstrip(".,!?;:)]}>\'")
     if not url_to_process.startswith(("http://", "https://")):
         url_to_process = "https://" + url_to_process
     await process_url_from_message(url_to_process, update, context)

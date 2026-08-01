@@ -27,13 +27,13 @@ A versatile Telegram bot powered by `yt-dlp` that allows users to download video
 This bot provides a rich set of features for both standard users and administrators:
 
 ### General
-*   **Broad Platform Support:** Leverages `yt-dlp` to download media from a vast array of websites.
+*   **Broad Platform Support:** Uses the current stable `yt-dlp` extractor registry plus its generic extractor, covering a very large range of sites. Support still depends on whether a site exposes downloadable media and whether its extractor is currently working.
 *   **Flexible Downloads:** Offers options to download media as video or (for privileged users) as audio.
 *   **File Naming:** Automatically sanitizes and names downloaded files for easy identification.
 
 ### User Features
 *   **Standard User Tier:**
-    *   Limited to **TikTok** video downloads only.
+    *   No platform restriction.
     *   Daily download limit of **5 files**.
     *   Max file size of **25MB**.
 *   **Premium User Tier:**
@@ -231,3 +231,7 @@ Contributions are welcome! If you have suggestions for improvements, bug fixes, 
 This project is open-source and distributed under the MIT License. See the `LICENSE` file for more details.
 
 ---
+
+### Cookies for multiple platforms
+
+The bot supports one complete browser-exported `cookies.txt` containing cookies for multiple sites. On Render, put it in Secret Files as `/etc/secrets/cookies.txt`. The bot also checks `YTDLP_COOKIES_FILE` and additional cookie files under `YTDLP_COOKIES_DIR` as fallbacks. yt-dlp requires Mozilla/Netscape cookie format; cookies are sensitive credentials and must never be committed to GitHub.
