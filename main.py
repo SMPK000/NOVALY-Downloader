@@ -9,6 +9,8 @@ from typing import Dict, Any, Tuple, Optional, List
 from uuid import uuid4
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from copy import deepcopy
+from html import escape
 import threading
 import aiohttp
 import yt_dlp
@@ -37,28 +39,52 @@ from telegram.error import TelegramError, Forbidden
 
 
 # --- Configuration & Constants ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Owner and Admin IDs
-OWNER_ID = int(os.getenv("OWNER_ID"))  # Replace with your actual Telegram user ID
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS").split(",")))
-# Bot Settings
-SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT")
-DOWNLOAD_DIR = "bot_downloads"
+def _parse_int_env(name: str, default: int = 0) -> int:
+    raw_value = os.getenv(name, "").strip()
+    try:
+        return int(raw_value) if raw_value else default
+    except ValueError:
+        return default
 
-# User Roles
+
+def _parse_int_list_env(name: str) -> List[int]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return []
+    values = []
+    for part in raw_value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.append(int(part))
+        except ValueError:
+            continue
+    return values
+
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OWNER_ID = _parse_int_env("OWNER_ID")
+ADMIN_IDS = _parse_int_list_env("ADMIN_IDS") or ([OWNER_ID] if OWNER_ID else [])
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "")
+DATA_DIR = os.getenv("DATA_DIR", "").strip()
+DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "bot_downloads")
+PERSISTENCE_FILE = os.getenv(
+    "PERSISTENCE_FILE",
+    os.path.join(DATA_DIR, "bot_persistence.pickle") if DATA_DIR else "bot_persistence.pickle",
+)
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+
 ROLE_ADMIN = "admin"
 ROLE_PREMIUM = "premium"
 ROLE_STANDARD = "standard"
 ROLE_BANNED = "banned"
 
-# Download & File Size Limits
-STANDARD_USER_DAILY_DOWNLOADS = 5
-STANDARD_USER_FILE_SIZE_LIMIT_MB = 25.0
-PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB = 49.5
+STANDARD_USER_DAILY_DOWNLOADS = int(os.getenv("STANDARD_USER_DAILY_DOWNLOADS", "5"))
+STANDARD_USER_FILE_SIZE_LIMIT_MB = float(os.getenv("STANDARD_USER_FILE_SIZE_LIMIT_MB", "25.0"))
+PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB = float(os.getenv("PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB", "49.5"))
 
-
-# Premium Tiers (Telegram Stars)
-PREMIUM_PRICES = {
+DEFAULT_PREMIUM_PRICES = {
     "3_days": {
         "stars": 50,
         "days": 3,
@@ -79,23 +105,22 @@ PREMIUM_PRICES = {
     },
 }
 
-# Persistence Keys
 CHANNEL_SUBSCRIPTION_CONFIG_KEY = "channel_subscription_config"
 BANNED_USERS_KEY = "banned_user_ids"
+BOT_SETTINGS_KEY = "bot_settings"
+SUPPORT_REPLY_MAP_KEY = "support_reply_map"
+ADMIN_WIZARD_STATE_KEY = "admin_wizard_state"
 
-# yt-dlp Constants
 MAX_RETRIES_YTDLP = 3
 RETRY_DELAY_YTDLP = 5
 USER_AGENT_YTDLP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
-# Other Constants
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?(?:\S+(?::\S*)?@)?(?:(?!10(?:\.\d{1,3}){3})(?!127(?:\.\d{1,3}){3})(?!169\.254(?:\.\d{1,3}){2})(?!192\.168(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)(?:\.(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)*(?:\.(?:[a-z\u00a1-\uffff]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?"
 TIKTOK_HOSTNAMES = ["tiktok.com", "www.tiktok.com", "vm.tiktok.com"]
 
-# Persistence Setup
-PERSISTENCE = PicklePersistence(filepath="bot_persistence.pickle")
+PERSISTENCE = PicklePersistence(filepath=PERSISTENCE_FILE)
 
-
+# --- Utility Functions ---
 # --- Utility Functions ---
 def sanitize_filename(filename: str, max_length: int = 60) -> str:
     sane = re.sub(r'[\\/*?:"<>|]', "_", filename).strip(" .")
@@ -143,24 +168,38 @@ def download_media_ytdlp(
 ) -> Tuple[bool, str, Optional[str], Optional[Dict[str, Any]]]:
     os.makedirs(output_dir, exist_ok=True)
     unique_prefix = uuid4().hex[:8]
-    ydl_initial_info_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "simulate": True,
-        "extract_flat": False,
-        "useragent": USER_AGENT_YTDLP,
-        "skip_download": True,
-        "verbose": False,
-    }
+    ydl_initial_info_opts = _build_ytdlp_common_opts(url)
     try:
         with yt_dlp.YoutubeDL(ydl_initial_info_opts) as ydl_info_fetch:
             media_info = ydl_info_fetch.extract_info(url, download=False)
         if not media_info:
             return False, "Could not retrieve media information.", None, None
     except yt_dlp.utils.DownloadError as e:
-        err_msg = str(e).lower()
-        if "unsupported url" in err_msg:
+        err_msg = str(e)
+        err_msg_lower = err_msg.lower()
+        if "unsupported url" in err_msg_lower:
             return False, "Invalid or unsupported URL.", None, None
+        if _yt_dlp_signin_hint(err_msg):
+            if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+                return (
+                    False,
+                    "YouTube asked for sign-in confirmation. Refresh the cookies file on the server and restart the bot.",
+                    None,
+                    None,
+                )
+            return (
+                False,
+                "YouTube asked for sign-in confirmation. Add a valid cookies.txt file on the server and set YTDLP_COOKIES_FILE.",
+                None,
+                None,
+            )
+        if "cookies" in err_msg_lower and "youtube" in err_msg_lower:
+            return (
+                False,
+                "YouTube needs cookies/authentication. Configure YTDLP_COOKIES_FILE with a valid cookies.txt file.",
+                None,
+                None,
+            )
         return False, f"Error fetching media info: {e}", None, None
     except Exception as e:
         print(f"Unexpected YTDLP info error for {url} (User: {user_id}): {e}")
@@ -181,6 +220,12 @@ def download_media_ytdlp(
         },
         "outtmpl": os.path.join(output_dir, f"{base_filename}.%(ext)s"),
     }
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        ydl_download_opts["cookiefile"] = YTDLP_COOKIES_FILE
+    if "youtube.com" in url or "youtu.be" in url or "youtube-nocookie.com" in url:
+        ydl_download_opts.setdefault(
+            "extractor_args", {"youtube": {"player_client": ["android", "web"]}}
+        )
     if format_choice == "video":
         ydl_download_opts["format"] = (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best"
@@ -251,13 +296,21 @@ def download_media_ytdlp(
             media_info,
         )
     except yt_dlp.utils.DownloadError as e:
-        print(f"ERROR: YTDLP DownloadError for {url} (User: {user_id}): {e}")
+        err_msg = str(e)
+        print(f"ERROR: YTDLP DownloadError for {url} (User: {user_id}): {err_msg}")
+        if _yt_dlp_signin_hint(err_msg):
+            return (
+                False,
+                "YouTube asked for sign-in confirmation. Add a valid cookies.txt file on the server and set YTDLP_COOKIES_FILE.",
+                None,
+                media_info,
+            )
         return False, f"Failed to download: {e}", None, media_info
     except Exception as e:
         print(f"ERROR: Unexpected YTDLP error for {url} (User: {user_id}): {e}")
         return False, f"Unexpected download error: {type(e).__name__}", None, media_info
 
-
+# --- User & Role Management ---
 # --- User & Role Management ---
 def get_user_role(
     user_id_to_check: int,
@@ -433,24 +486,26 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_role_for_display = get_user_role(
         effective_user.id, context, effective_user, for_display=True
     )
+    standard_daily_limit = get_standard_daily_limit(context)
+    standard_size_limit = get_standard_file_size_limit_mb(context)
     base_help = (
         "🌟 **Welcome to the Media Downloader Bot!** 🌟\n\n"
         "Here's how I can help you:\n"
-        "1. Send me a link to a video or audio from platforms like TikTok, YouTube, Instagram, etc.\n"
+        "1. Send me a link to a video or audio from any supported platform.\n"
         "2. I'll process it and send back the media file for you to save!\n\n"
         "🔗 **Available Commands for Everyone:**\n"
         "  /start - Initialize or restart the bot.\n"
         "  /help - Show this help message.\n"
         "  /myrole - Check your current user status, limits, and premium days.\n"
         "  /premium - Explore options to upgrade to Premium for more features!\n"
-        f"  /support - Need help? Contact {SUPPORT_CONTACT}.\n\n"
+        "  /support - Open an in-bot support chat.\n\n"
     )
     standard_limits_info = (
         "💡 **Standard User Info:**\n"
-        f"  - Download up to {STANDARD_USER_DAILY_DOWNLOADS} files per day.\n"
-        f"  - Limited to TikTok videos only.\n"
-        f"  - Video format only.\n"
-        f"  - Max file size: {STANDARD_USER_FILE_SIZE_LIMIT_MB:.0f}MB.\n"
+        f"  - Download up to {standard_daily_limit} files per day.\n"
+        f"  - Download from supported platforms without platform restrictions.\n"
+        f"  - Video or audio depends on the source and your access level.\n"
+        f"  - Max file size: {standard_size_limit:.0f}MB.\n"
         "  Consider /premium for an unrestricted experience!\n"
     )
     premium_perks_info = (
@@ -458,7 +513,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  - Unlimited daily downloads!\n"
         "  - Download from a wider range of platforms.\n"
         "  - Download audio & video formats.\n"
-        "  - Higher file size limits (up to Telegram's max for direct send).\n"
+        "  - Higher file size limits (up to Telegram's direct send limit).\n"
     )
     final_help_msg = base_help
     is_admin_for_commands = effective_user.id in ADMIN_IDS
@@ -476,14 +531,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_help_msg += premium_perks_info
     if is_admin_for_commands:
         final_help_msg += (
-            "\n👑 **Admin Exclusive Commands:**\n"
-            "  /broadcast `[reply to message]` - Send message to all users.\n"
-            "  /setuserpremium `[user_id] [days]` - Grant premium status.\n"
-            "  /removeuserpremium `[user_id]` - Revoke premium status.\n"
-            "  /banuser `[user_id]` - Ban a user.\n"
-            "  /unbanuser `[user_id]` - Unban a user.\n"
+            "\n👑 **Admin Tools:**\n"
+            "  /broadcast - Reply to a message to broadcast it to all users.\n"
+            "  /setuserpremium - Bot will ask for user ID, then days.\n"
+            "  /removeuserpremium - Bot will ask for user ID.\n"
+            "  /banuser - Bot will ask for user ID.\n"
+            "  /unbanuser - Bot will ask for user ID.\n"
+            "  /setpremiumprice - Update a premium tier price interactively.\n"
+            "  /setlimits - Change standard daily downloads and file size limits.\n"
             "  /togglechannelcheck - Enable/disable mandatory channel join.\n"
-            "  /setrequiredchannels `[@ch1 ID2...]` or `none` - Set channels.\n"
+            "  /setrequiredchannels - Set required channels or use none.\n"
             "  /stats - View bot usage statistics.\n"
             "  /viewusers - List users with details.\n"
         )
@@ -532,23 +589,27 @@ async def myrole_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ud.get("last_download_date") != today:
             ud["daily_downloads_count"] = 0
         dl_today = ud.get("daily_downloads_count", 0)
-        rem_dl = max(0, STANDARD_USER_DAILY_DOWNLOADS - dl_today)
+        rem_dl = max(0, get_standard_daily_limit(context) - dl_today)
         msg.extend(
             [
-                f"📥 **Downloads Today:** {dl_today}/{STANDARD_USER_DAILY_DOWNLOADS} (Remaining: {rem_dl})",
-                f"⚠️ **Restrictions:** TikTok videos only, video format only, max {STANDARD_USER_FILE_SIZE_LIMIT_MB:.0f}MB.",
+                f"📥 **Downloads Today:** {dl_today}/{get_standard_daily_limit(context)} (Remaining: {rem_dl})",
+                f"⚠️ **Restrictions:** Supported platforms only, video/audio depending on source and access, max {get_standard_file_size_limit_mb(context):.0f}MB.",
             ]
         )
     await update.message.reply_html("\n".join(msg))
 
 
 async def support_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(
-        f"For assistance, please contact our support: {SUPPORT_CONTACT}"
+    _clear_support_mode(context)
+    context.user_data["support_mode"] = True
+    await context.application.persistence.flush()
+    await update.message.reply_text(
+        "🛟 Support chat is open. Send one message with your issue here, and I will forward it to support inside the bot."
     )
 
 
 async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    premium_prices = get_premium_prices(context)
     buttons = [
         [
             InlineKeyboardButton(
@@ -556,7 +617,7 @@ async def premium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"BUY_PREMIUM_{key}",
             )
         ]
-        for key, info in PREMIUM_PRICES.items()
+        for key, info in premium_prices.items()
     ]
     await update.message.reply_html(
         "🌟 **Unlock Premium Features!** 🌟\n\n"
@@ -612,7 +673,7 @@ async def process_url_from_message(
     message_text = "Choose your desired format:"
     if role == ROLE_STANDARD and not allow_all:
         message_text = (
-            "Choose your desired format (TikTok video only for standard users):"
+            "Choose your desired format:"
         )
     await update.message.reply_text(
         message_text,
@@ -628,12 +689,305 @@ async def _can_standard_user_download(
     joined, ch_msg = await check_channel_join(user_id, context)
     if not joined:
         return False, ch_msg or "Please join our channel(s) to continue."
-    if not is_tiktok_url(url):
-        return (
-            False,
-            "Standard users can only download from TikTok. /premium for all supported sources.",
-        )
     return True, None
+
+
+async def process_url_from_message(
+    url: str, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    user = update.effective_user
+    if not user:
+        return
+    user_id = user.id
+    role = get_user_role(user_id, context, user)
+    await context.application.persistence.flush()
+    if role == ROLE_BANNED:
+        await update.message.reply_text("You are banned from using this bot.")
+        return
+    is_admin_check = user_id in ADMIN_IDS or user_id == OWNER_ID
+    is_premium_active_check = False
+    if context.user_data.get("is_premium"):
+        exp_ts = context.user_data.get("premium_expiry_timestamp")
+        if exp_ts and exp_ts > datetime.datetime.now().timestamp():
+            is_premium_active_check = True
+    allow_all = is_admin_check or is_premium_active_check
+    if role == ROLE_STANDARD and not allow_all:
+        can_download, reason = await _can_standard_user_download(user_id, url, context)
+        if not can_download:
+            await update.message.reply_html(reason or "Download not allowed")
+            return
+    context.user_data.update(
+        {
+            "current_url_to_download": url,
+            "last_message_id_for_url": update.message.message_id,
+        }
+    )
+    buttons = [[InlineKeyboardButton("🎬 Video", callback_data="dl_video")]]
+    if allow_all:
+        buttons[0].append(
+            InlineKeyboardButton("🎵 Audio (Original)", callback_data="dl_audio")
+        )
+    await update.message.reply_text(
+        "Choose your desired format:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_to_message_id=update.message.message_id,
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+
+async def _process_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not update.effective_user:
+        return
+    user = update.effective_user
+    support_recipient_ids = []
+    if OWNER_ID:
+        support_recipient_ids.append(OWNER_ID)
+    support_recipient_ids.extend([aid for aid in ADMIN_IDS if aid and aid != OWNER_ID])
+    support_recipient_ids = list(dict.fromkeys(support_recipient_ids))
+    if not support_recipient_ids:
+        await message.reply_text(
+            "Support is currently unavailable because no admin/owner ID is configured."
+        )
+        _clear_support_mode(context)
+        return
+
+    sent_any = False
+    for recipient_id in support_recipient_ids:
+        try:
+            header = await context.bot.send_message(
+                chat_id=recipient_id,
+                text=(
+                    "🛟 New support request\n"
+                    f"From: {escape(user.full_name)} (<code>{user.id}</code>)\n"
+                    f"Chat: <code>{message.chat_id}</code>\n"
+                    "Reply to this support message to answer the user."
+                ),
+                parse_mode=constants.ParseMode.HTML,
+            )
+            copied = await context.bot.copy_message(
+                chat_id=recipient_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                reply_to_message_id=header.message_id,
+            )
+            copied_message_id = getattr(copied, "message_id", None)
+            if copied_message_id:
+                _register_support_reply_target(context, recipient_id, copied_message_id, user.id)
+            sent_any = True
+        except TelegramError as e:
+            print(f"WARNING: Failed to forward support message to {recipient_id}: {e}")
+    _clear_support_mode(context)
+    await message.reply_text(
+        "✅ Your support message was sent. A reply will come back here inside the bot."
+        if sent_any
+        else "❌ I could not forward your support message."
+    )
+
+async def _process_admin_wizard_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.message
+    user = update.effective_user
+    if not message or not user or not _admin_is_authorized(user.id):
+        return False
+
+    state = context.user_data.get(ADMIN_WIZARD_STATE_KEY)
+    if not state:
+        return False
+
+    text_in = (message.text or message.caption or "").strip()
+    if not text_in:
+        await message.reply_text("Please send a text value for this step.")
+        return True
+
+    action = state.get("action")
+    step = state.get("step")
+
+    async def fail_and_clear(err_text: str) -> bool:
+        _clear_admin_pending_state(context)
+        await message.reply_text(err_text)
+        return True
+
+    try:
+        if action == "setuserpremium":
+            if step == "await_user_id":
+                target_user_id = int(text_in)
+                state.update({"step": "await_days", "target_user_id": target_user_id})
+                _set_admin_pending_state(context, state)
+                await message.reply_text("Now send the number of days for premium.")
+                return True
+            if step == "await_days":
+                target_user_id = int(state["target_user_id"])
+                days = int(text_in)
+                if days <= 0:
+                    return await fail_and_clear("Days must be a positive number.")
+                target_ud = context.application.persistence.user_data.setdefault(
+                    target_user_id, {"_id": target_user_id}
+                )
+                target_ud["is_premium"] = True
+                current_expiry_ts = target_ud.get("premium_expiry_timestamp", 0.0) or 0.0
+                now_ts = datetime.datetime.now().timestamp()
+                start_date_for_new_premium = (
+                    datetime.datetime.fromtimestamp(current_expiry_ts)
+                    if current_expiry_ts > now_ts
+                    else datetime.datetime.now()
+                )
+                target_ud["premium_expiry_timestamp"] = (
+                    start_date_for_new_premium + datetime.timedelta(days=days)
+                ).timestamp()
+                target_ud["premium_tier"] = f"admin_grant_{days}d"
+                await context.application.persistence.flush()
+                expiry_dt_str = datetime.datetime.fromtimestamp(
+                    target_ud["premium_expiry_timestamp"]
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+                await message.reply_text(
+                    f"✅ User {target_user_id} has been granted Premium for {days} days. Their premium now expires on {expiry_dt_str}."
+                )
+                try:
+                    await context.bot.send_message(
+                        target_user_id,
+                        f"🎉 Congratulations! An admin has granted you Premium access for {days} days.",
+                    )
+                except Exception as e:
+                    print(
+                        f"WARNING: Failed to notify user {target_user_id} of manual premium: {e}"
+                    )
+                _clear_admin_pending_state(context)
+                return True
+
+        elif action == "removeuserpremium":
+            target_user_id = int(text_in)
+            if target_user_id not in context.application.persistence.user_data:
+                return await fail_and_clear(
+                    f"User {target_user_id} not found in bot data. Cannot remove premium."
+                )
+            target_ud = context.application.persistence.user_data[target_user_id]
+            target_ud["is_premium"] = False
+            target_ud["premium_expiry_timestamp"] = None
+            target_ud["premium_tier"] = "admin_revoked"
+            await context.application.persistence.flush()
+            await message.reply_text(
+                f"✅ Premium status for user {target_user_id} has been revoked."
+            )
+            try:
+                await context.bot.send_message(
+                    target_user_id,
+                    "ℹ️ Your Premium access has been revoked by an administrator.",
+                )
+            except Exception as e:
+                print(
+                    f"WARNING: Failed to notify user {target_user_id} of premium revocation: {e}"
+                )
+            _clear_admin_pending_state(context)
+            return True
+
+        elif action == "banuser":
+            target_user_id = int(text_in)
+            if target_user_id == user.id:
+                return await fail_and_clear("You cannot ban yourself.")
+            if target_user_id in ADMIN_IDS or target_user_id == OWNER_ID:
+                return await fail_and_clear("Admins cannot be banned.")
+            banned_users_set = context.bot_data.setdefault(BANNED_USERS_KEY, set())
+            if target_user_id in banned_users_set:
+                return await fail_and_clear(f"User {target_user_id} is already banned.")
+            banned_users_set.add(target_user_id)
+            if target_user_id in context.application.persistence.user_data:
+                target_ud = context.application.persistence.user_data[target_user_id]
+                target_ud.update(
+                    {
+                        "is_premium": False,
+                        "premium_expiry_timestamp": None,
+                        "premium_tier": "revoked_banned",
+                    }
+                )
+            await context.application.persistence.flush()
+            await message.reply_text(
+                f"🚫 User {target_user_id} has been banned and their premium (if any) revoked."
+            )
+            _clear_admin_pending_state(context)
+            return True
+
+        elif action == "unbanuser":
+            target_user_id = int(text_in)
+            banned_users_set = context.bot_data.setdefault(BANNED_USERS_KEY, set())
+            if target_user_id in banned_users_set:
+                banned_users_set.remove(target_user_id)
+                await context.application.persistence.flush()
+                await message.reply_text(f"✅ User {target_user_id} has been unbanned.")
+            else:
+                await message.reply_text(
+                    f"User {target_user_id} was not found in the ban list."
+                )
+            _clear_admin_pending_state(context)
+            return True
+
+        elif action == "setpremiumprice":
+            if step == "await_tier":
+                tier_key = text_in.strip()
+                state.update({"step": "await_stars", "tier_key": tier_key})
+                _set_admin_pending_state(context, state)
+                await message.reply_text("Now send the price in Telegram Stars.")
+                return True
+            if step == "await_stars":
+                stars = int(text_in)
+                if stars <= 0:
+                    return await fail_and_clear("Stars must be a positive number.")
+                state.update({"step": "await_days", "stars": stars})
+                _set_admin_pending_state(context, state)
+                await message.reply_text("Now send the number of days for this tier.")
+                return True
+            if step == "await_days":
+                days = int(text_in)
+                if days <= 0:
+                    return await fail_and_clear("Days must be a positive number.")
+                tier_key = state["tier_key"]
+                stars = int(state["stars"])
+                premium_prices = get_premium_prices(context)
+                premium_prices[tier_key] = {
+                    "stars": stars,
+                    "days": days,
+                    "title": _make_premium_price_title(days),
+                    "description": _make_premium_price_description(days),
+                }
+                await context.application.persistence.flush()
+                await message.reply_text(
+                    f"✅ Premium tier '{tier_key}' updated: {stars} Stars for {days} days."
+                )
+                _clear_admin_pending_state(context)
+                return True
+
+        elif action == "setlimits":
+            if step == "await_daily_limit":
+                daily_limit = int(text_in)
+                if daily_limit <= 0:
+                    return await fail_and_clear("Daily limit must be a positive number.")
+                state.update({"step": "await_file_size", "daily_limit": daily_limit})
+                _set_admin_pending_state(context, state)
+                await message.reply_text(
+                    "Now send the max file size in MB for standard users."
+                )
+                return True
+            if step == "await_file_size":
+                file_size_mb = float(text_in)
+                if file_size_mb <= 0:
+                    return await fail_and_clear("File size limit must be a positive number.")
+                settings = get_bot_settings(context)
+                settings["standard_user_daily_downloads"] = int(state["daily_limit"])
+                settings["standard_user_file_size_limit_mb"] = float(file_size_mb)
+                await context.application.persistence.flush()
+                await message.reply_text(
+                    f"✅ Standard user limits updated: {settings['standard_user_daily_downloads']} downloads/day, {settings['standard_user_file_size_limit_mb']:.0f}MB max file size."
+                )
+                _clear_admin_pending_state(context)
+                return True
+    except ValueError:
+        await message.reply_text("Invalid number. Please send a valid numeric value.")
+        return True
+
+    _clear_admin_pending_state(context)
+    await message.reply_text(
+        "That admin action is no longer active. Please run the command again."
+    )
+    return True
 
 
 async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -643,7 +997,37 @@ async def handle_url_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         or not update.effective_user
     ):
         return
-    text_to_search = update.message.text or update.message.caption
+
+    user = update.effective_user
+    message_text = update.message.text or update.message.caption or ""
+    is_admin_user = _admin_is_authorized(user.id)
+
+    if is_admin_user and update.message.reply_to_message:
+        reply_target_user_id = _lookup_support_reply_target(
+            context, update.message.chat_id, update.message.reply_to_message.message_id
+        )
+        if reply_target_user_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=reply_target_user_id,
+                    text=f"🛟 Support reply:\n{message_text}",
+                    parse_mode=constants.ParseMode.HTML,
+                )
+                await update.message.reply_text("✅ Support reply sent.")
+            except TelegramError as e:
+                await update.message.reply_text(f"Failed to send support reply: {e}")
+            return
+
+    if is_admin_user and context.user_data.get(ADMIN_WIZARD_STATE_KEY):
+        handled = await _process_admin_wizard_message(update, context)
+        if handled:
+            return
+
+    if context.user_data.get("support_mode"):
+        await _process_support_message(update, context)
+        return
+
+    text_to_search = message_text
     urls_from_entities = [
         text_to_search[e.offset : e.offset + e.length]
         for el in [update.message.entities, update.message.caption_entities]
@@ -721,7 +1105,7 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
         except TelegramError:
             pass
             return
-    is_admin = user_id in ADMIN_IDS
+    is_admin = user_id in ADMIN_IDS or user_id == OWNER_ID
     is_premium_active = False
     if context.user_data.get("is_premium"):
         exp_ts = context.user_data.get("premium_expiry_timestamp")
@@ -742,7 +1126,7 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
         if not check_and_update_daily_limit(user_id, context):
             try:
                 await query.edit_message_text(
-                    f"Daily download limit ({STANDARD_USER_DAILY_DOWNLOADS}) reached. /premium for more!"
+                    f"Daily download limit ({get_standard_daily_limit(context)}) reached. /premium for more!"
                 )
             except TelegramError:
                 pass
@@ -771,9 +1155,9 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
             file_size_mb = os.path.getsize(file_path_final) / (1024 * 1024)
             caption = format_media_caption(media_info_from_ytdlp, url)
             current_user_size_limit = (
-                STANDARD_USER_FILE_SIZE_LIMIT_MB
+                get_standard_file_size_limit_mb(context)
                 if is_standard_non_privileged
-                else PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB
+                else get_premium_direct_limit_mb(context)
             )
             if file_size_mb > current_user_size_limit:
                 size_err_msg = (
@@ -883,15 +1267,16 @@ async def premium_tier_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     await query.answer()
     tier_key = query.data.replace("BUY_PREMIUM_", "")
-    if tier_key not in PREMIUM_PRICES:
+    premium_prices = get_premium_prices(context)
+    if tier_key not in premium_prices:
         try:
             await query.edit_message_text("Invalid tier.")
         except TelegramError:
             pass
             return
-    info = PREMIUM_PRICES[tier_key]
+    info = premium_prices[tier_key]
     payload = f"premium_{tier_key}_{query.from_user.id}_{uuid4().hex[:6]}"
-    prices = [LabeledPrice(label=info["title"], amount=info["stars"])]
+    prices = [LabeledPrice(label=info["title"], amount=int(info["stars"]))]
     try:
         await context.bot.send_invoice(
             chat_id=query.message.chat_id,
@@ -927,7 +1312,8 @@ async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     tier_key = "_".join(parts[1:-2])
     user_id_payload = parts[-2]
-    if tier_key not in PREMIUM_PRICES:
+    premium_prices = get_premium_prices(context)
+    if tier_key not in premium_prices:
         print(
             f"WARNING: Precheckout for unknown tier: {tier_key} from payload {query.invoice_payload}"
         )
@@ -960,8 +1346,9 @@ async def successful_payment_callback(
     parts = payment.invoice_payload.split("_")
     tier_key = "_".join(parts[1:-2])
     user_id = update.effective_user.id
-    if tier_key in PREMIUM_PRICES:
-        days = PREMIUM_PRICES[tier_key]["days"]
+    premium_prices = get_premium_prices(context)
+    if tier_key in premium_prices:
+        days = premium_prices[tier_key]["days"]
         ud = context.application.persistence.user_data.setdefault(
             user_id, {"_id": user_id}
         )
@@ -981,7 +1368,7 @@ async def successful_payment_callback(
         ud["premium_tier"] = tier_key
         await context.application.persistence.flush()
         await update.message.reply_text(
-            f"🎉 Thank you! Your Premium ({PREMIUM_PRICES[tier_key]['title']}) is now active for {days} days!"
+            f"🎉 Thank you! Your Premium ({premium_prices[tier_key]['title']}) is now active for {days} days!"
         )
         print(
             f"User {user_id} successfully purchased {tier_key} premium for {days} days. New expiry: {datetime.datetime.fromtimestamp(ud['premium_expiry_timestamp'])}"
@@ -998,149 +1385,44 @@ async def successful_payment_callback(
 async def admin_command_wrapper(
     update: Update, context: ContextTypes.DEFAULT_TYPE, command_func, *args, **kwargs
 ):
-    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_user or (
+        update.effective_user.id not in ADMIN_IDS and update.effective_user.id != OWNER_ID
+    ):
         await update.message.reply_text("⛔ This command is for admins only.")
         return
     await command_func(update, context, *args, **kwargs)
 
 
 async def set_user_premium_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 2:
-        await update.message.reply_text("Usage: /setuserpremium `[user_id] [days]`")
-        return
-    try:
-        target_user_id = int(context.args[0])
-        days = int(context.args[1])
-        if days <= 0:
-            await update.message.reply_text("Days must be a positive number.")
-            return
-    except ValueError:
-        await update.message.reply_text(
-            "Invalid user ID or days. Both must be numbers."
-        )
-        return
-    target_ud = context.application.persistence.user_data.setdefault(
-        target_user_id, {"_id": target_user_id}
-    )
-    target_ud["is_premium"] = True
-    current_expiry_ts = target_ud.get("premium_expiry_timestamp", 0.0)
-    if current_expiry_ts is None:
-        current_expiry_ts = 0.0
-    now_ts = datetime.datetime.now().timestamp()
-    start_date_for_new_premium = (
-        datetime.datetime.fromtimestamp(current_expiry_ts)
-        if current_expiry_ts > now_ts
-        else datetime.datetime.now()
-    )
-    target_ud["premium_expiry_timestamp"] = (
-        start_date_for_new_premium + datetime.timedelta(days=days)
-    ).timestamp()
-    target_ud["premium_tier"] = f"admin_grant_{days}d"
-    await context.application.persistence.flush()
-    expiry_dt_str = datetime.datetime.fromtimestamp(
-        target_ud["premium_expiry_timestamp"]
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await update.message.reply_text(
-        f"✅ User {target_user_id} has been granted Premium for {days} days. Their premium now expires on {expiry_dt_str}."
-    )
-    try:
-        await context.bot.send_message(
-            target_user_id,
-            f"🎉 Congratulations! An admin has granted you Premium access for {days} days.",
-        )
-    except Exception as e:
-        print(f"WARNING: Failed to notify user {target_user_id} of manual premium: {e}")
+    _set_admin_pending_state(context, {"action": "setuserpremium", "step": "await_user_id"})
+    await update.message.reply_text("Send the user ID to grant Premium to.")
 
 
 async def remove_user_premium_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /removeuserpremium `[user_id]`")
-        return
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid user ID. It must be a number.")
-        return
-    if target_user_id not in context.application.persistence.user_data:
-        await update.message.reply_text(
-            f"User {target_user_id} not found in bot data. Cannot remove premium."
-        )
-        return
-    target_ud = context.application.persistence.user_data[target_user_id]
-    if not target_ud.get("is_premium") and not target_ud.get(
-        "premium_expiry_timestamp"
-    ):
-        await update.message.reply_text(
-            f"User {target_user_id} is not currently premium or has no premium data."
-        )
-        return
-    target_ud["is_premium"] = False
-    target_ud["premium_expiry_timestamp"] = None
-    target_ud["premium_tier"] = "admin_revoked"
-    await context.application.persistence.flush()
-    await update.message.reply_text(
-        f"✅ Premium status for user {target_user_id} has been revoked."
-    )
-    try:
-        await context.bot.send_message(
-            target_user_id,
-            "ℹ️ Your Premium access has been revoked by an administrator.",
-        )
-    except Exception as e:
-        print(
-            f"WARNING: Failed to notify user {target_user_id} of premium revocation: {e}"
-        )
+    _set_admin_pending_state(context, {"action": "removeuserpremium", "step": "await_user_id"})
+    await update.message.reply_text("Send the user ID to revoke Premium from.")
 
 
 async def ban_user_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_user:
-        return
-    try:
-        target_user_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /banuser `[user_id]`")
-        return
-    if target_user_id == update.effective_user.id:
-        await update.message.reply_text("You cannot ban yourself.")
-        return
-    if target_user_id in ADMIN_IDS:
-        await update.message.reply_text("Admins cannot be banned.")
-        return
-    banned_users_set = context.bot_data.setdefault(BANNED_USERS_KEY, set())
-    if target_user_id in banned_users_set:
-        await update.message.reply_text(f"User {target_user_id} is already banned.")
-        return
-    banned_users_set.add(target_user_id)
-    if target_user_id in context.application.persistence.user_data:
-        target_ud = context.application.persistence.user_data[target_user_id]
-        target_ud.update(
-            {
-                "is_premium": False,
-                "premium_expiry_timestamp": None,
-                "premium_tier": "revoked_banned",
-            }
-        )
-    await context.application.persistence.flush()
-    await update.message.reply_text(
-        f"🚫 User {target_user_id} has been banned and their premium (if any) revoked."
-    )
+    _set_admin_pending_state(context, {"action": "banuser", "step": "await_user_id"})
+    await update.message.reply_text("Send the user ID to ban.")
 
 
 async def unban_user_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        target_user_id = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("Usage: /unbanuser `[user_id]`")
-        return
-    banned_users_set = context.bot_data.setdefault(BANNED_USERS_KEY, set())
-    if target_user_id in banned_users_set:
-        banned_users_set.remove(target_user_id)
-        await context.application.persistence.flush()
-        await update.message.reply_text(f"✅ User {target_user_id} has been unbanned.")
-    else:
-        await update.message.reply_text(
-            f"User {target_user_id} was not found in the ban list."
-        )
+    _set_admin_pending_state(context, {"action": "unbanuser", "step": "await_user_id"})
+    await update.message.reply_text("Send the user ID to unban.")
+
+
+async def set_premium_price_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _set_admin_pending_state(context, {"action": "setpremiumprice", "step": "await_tier"})
+    await update.message.reply_text(
+        "Send the tier key to edit (for example: 3_days, 30_days, 365_days, or a custom key)."
+    )
+
+
+async def set_limits_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _set_admin_pending_state(context, {"action": "setlimits", "step": "await_daily_limit"})
+    await update.message.reply_text("Send the new standard-user daily download limit.")
 
 
 async def broadcast_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1371,7 +1653,7 @@ async def view_users_impl(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data.get("daily_downloads_count", 0) if last_dl_date == today_iso else 0
             )
             user_line.append(
-                f"   **Downloads Today:** {downloads_today}/{STANDARD_USER_DAILY_DOWNLOADS}"
+                f"   **Downloads Today:** {downloads_today}/{get_standard_daily_limit(context)}"
             )
         user_details_list.append("\n".join(user_line))
         if (i + 1) % MAX_USERS_PER_MESSAGE == 0 or (i + 1) == len(all_user_data_items):
@@ -1511,6 +1793,14 @@ def main():
         CommandHandler(
             "setrequiredchannels",
             lambda u, c: admin_command_wrapper(u, c, set_required_channels_impl),
+        ),
+        CommandHandler(
+            "setpremiumprice",
+            lambda u, c: admin_command_wrapper(u, c, set_premium_price_impl),
+        ),
+        CommandHandler(
+            "setlimits",
+            lambda u, c: admin_command_wrapper(u, c, set_limits_impl),
         ),
         CommandHandler("stats", lambda u, c: admin_command_wrapper(u, c, stats_impl)),
         CommandHandler(
