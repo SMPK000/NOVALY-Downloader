@@ -118,7 +118,115 @@ USER_AGENT_YTDLP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?(?:\S+(?::\S*)?@)?(?:(?!10(?:\.\d{1,3}){3})(?!127(?:\.\d{1,3}){3})(?!169\.254(?:\.\d{1,3}){2})(?!192\.168(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)(?:\.(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)*(?:\.(?:[a-z\u00a1-\uffff]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?"
 TIKTOK_HOSTNAMES = ["tiktok.com", "www.tiktok.com", "vm.tiktok.com"]
 
+# Ensure persistence parent directory exists before PicklePersistence opens the file.
+_persistence_parent = os.path.dirname(os.path.abspath(PERSISTENCE_FILE))
+if _persistence_parent:
+    os.makedirs(_persistence_parent, exist_ok=True)
 PERSISTENCE = PicklePersistence(filepath=PERSISTENCE_FILE)
+
+
+def _admin_is_authorized(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id == OWNER_ID
+
+
+def get_bot_settings(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    settings = context.bot_data.setdefault(BOT_SETTINGS_KEY, {})
+    settings.setdefault("standard_user_daily_downloads", STANDARD_USER_DAILY_DOWNLOADS)
+    settings.setdefault("standard_user_file_size_limit_mb", STANDARD_USER_FILE_SIZE_LIMIT_MB)
+    settings.setdefault("premium_direct_send_limit_mb", PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB)
+    settings.setdefault("premium_prices", deepcopy(DEFAULT_PREMIUM_PRICES))
+    return settings
+
+
+def get_standard_daily_limit(context: ContextTypes.DEFAULT_TYPE) -> int:
+    return int(get_bot_settings(context).get("standard_user_daily_downloads", STANDARD_USER_DAILY_DOWNLOADS))
+
+
+def get_standard_file_size_limit_mb(context: ContextTypes.DEFAULT_TYPE) -> float:
+    return float(get_bot_settings(context).get("standard_user_file_size_limit_mb", STANDARD_USER_FILE_SIZE_LIMIT_MB))
+
+
+def get_premium_direct_limit_mb(context: ContextTypes.DEFAULT_TYPE) -> float:
+    return float(get_bot_settings(context).get("premium_direct_send_limit_mb", PREMIUM_ADMIN_DIRECT_SEND_LIMIT_MB))
+
+
+def get_premium_prices(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    settings = get_bot_settings(context)
+    prices = settings.get("premium_prices")
+    if not isinstance(prices, dict) or not prices:
+        prices = deepcopy(DEFAULT_PREMIUM_PRICES)
+        settings["premium_prices"] = prices
+    return prices
+
+
+def _make_premium_price_title(days: int) -> str:
+    return f"Premium ({days} Days)"
+
+
+def _make_premium_price_description(days: int) -> str:
+    return f"{days} days of Premium access"
+
+
+def _set_admin_pending_state(context: ContextTypes.DEFAULT_TYPE, state: Dict[str, Any]) -> None:
+    context.user_data[ADMIN_WIZARD_STATE_KEY] = dict(state)
+
+
+def _clear_admin_pending_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop(ADMIN_WIZARD_STATE_KEY, None)
+
+
+def _clear_support_mode(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("support_mode", None)
+
+
+def _register_support_reply_target(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int, admin_message_id: int, user_id: int) -> None:
+    mapping = context.bot_data.setdefault(SUPPORT_REPLY_MAP_KEY, {})
+    mapping[f"{admin_chat_id}:{admin_message_id}"] = int(user_id)
+
+
+def _lookup_support_reply_target(context: ContextTypes.DEFAULT_TYPE, admin_chat_id: int, admin_message_id: int) -> Optional[int]:
+    mapping = context.bot_data.get(SUPPORT_REPLY_MAP_KEY, {})
+    value = mapping.get(f"{admin_chat_id}:{admin_message_id}")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _yt_dlp_signin_hint(error_text: str) -> bool:
+    text = str(error_text).lower()
+    return any(x in text for x in (
+        "sign in to confirm you're not a bot",
+        "sign in to confirm you’re not a bot",
+        "confirm you're not a bot",
+        "confirm you’re not a bot",
+        "cookies-from-browser",
+        "cookies for the youtube extractor",
+    ))
+
+
+def _build_ytdlp_common_opts(url: str) -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "useragent": USER_AGENT_YTDLP,
+        "retries": MAX_RETRIES_YTDLP,
+        "fragment_retries": MAX_RETRIES_YTDLP,
+        "socket_timeout": 30,
+        "noplaylist": False,
+    }
+    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    # YouTube frequently changes which clients work without authentication.
+    # Cookies remain the reliable solution when YouTube presents an anti-bot challenge.
+    if any(host in url.lower() for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web_safari", "android_vr", "web"],
+                "skip": ["translated_subs"],
+            }
+        }
+    return opts
 
 # --- Utility Functions ---
 # --- Utility Functions ---
@@ -504,14 +612,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 **Standard User Info:**\n"
         f"  - Download up to {standard_daily_limit} files per day.\n"
         f"  - Download from supported platforms without platform restrictions.\n"
-        f"  - Video or audio depends on the source and your access level.\n"
+        f"  - Video and audio downloads are available.\n"
         f"  - Max file size: {standard_size_limit:.0f}MB.\n"
         "  Consider /premium for an unrestricted experience!\n"
     )
     premium_perks_info = (
         "💎 **Premium User Perks:**\n"
         "  - Unlimited daily downloads!\n"
-        "  - Download from a wider range of platforms.\n"
+        "  - No platform restriction; downloads use yt-dlp-supported sites.\n"
         "  - Download audio & video formats.\n"
         "  - Higher file size limits (up to Telegram's direct send limit).\n"
     )
@@ -593,7 +701,7 @@ async def myrole_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg.extend(
             [
                 f"📥 **Downloads Today:** {dl_today}/{get_standard_daily_limit(context)} (Remaining: {rem_dl})",
-                f"⚠️ **Restrictions:** Supported platforms only, video/audio depending on source and access, max {get_standard_file_size_limit_mb(context):.0f}MB.",
+                f"⚠️ **Restrictions:** {get_standard_daily_limit(context)} downloads/day and max {get_standard_file_size_limit_mb(context):.0f}MB per file.",
             ]
         )
     await update.message.reply_html("\n".join(msg))
@@ -647,63 +755,6 @@ async def process_url_from_message(
     if role == ROLE_BANNED:
         await update.message.reply_text("You are banned from using this bot.")
         return
-    is_admin_check = user_id in ADMIN_IDS
-    is_premium_active_check = False
-    if context.user_data.get("is_premium"):
-        exp_ts = context.user_data.get("premium_expiry_timestamp")
-        if exp_ts and exp_ts > datetime.datetime.now().timestamp():
-            is_premium_active_check = True
-    allow_all = is_admin_check or is_premium_active_check
-    if role == ROLE_STANDARD and not allow_all:
-        can_download, reason = await _can_standard_user_download(user_id, url, context)
-        if not can_download:
-            await update.message.reply_html(reason or "Download not allowed")
-            return
-    context.user_data.update(
-        {
-            "current_url_to_download": url,
-            "last_message_id_for_url": update.message.message_id,
-        }
-    )
-    buttons = [[InlineKeyboardButton("🎬 Video", callback_data="dl_video")]]
-    if allow_all:
-        buttons[0].append(
-            InlineKeyboardButton("🎵 Audio (Original)", callback_data="dl_audio")
-        )
-    message_text = "Choose your desired format:"
-    if role == ROLE_STANDARD and not allow_all:
-        message_text = (
-            "Choose your desired format:"
-        )
-    await update.message.reply_text(
-        message_text,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        reply_to_message_id=update.message.message_id,
-        parse_mode=constants.ParseMode.HTML,
-    )
-
-
-async def _can_standard_user_download(
-    user_id: int, url: str, context: ContextTypes.DEFAULT_TYPE
-) -> Tuple[bool, Optional[str]]:
-    joined, ch_msg = await check_channel_join(user_id, context)
-    if not joined:
-        return False, ch_msg or "Please join our channel(s) to continue."
-    return True, None
-
-
-async def process_url_from_message(
-    url: str, update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user:
-        return
-    user_id = user.id
-    role = get_user_role(user_id, context, user)
-    await context.application.persistence.flush()
-    if role == ROLE_BANNED:
-        await update.message.reply_text("You are banned from using this bot.")
-        return
     is_admin_check = user_id in ADMIN_IDS or user_id == OWNER_ID
     is_premium_active_check = False
     if context.user_data.get("is_premium"):
@@ -722,11 +773,10 @@ async def process_url_from_message(
             "last_message_id_for_url": update.message.message_id,
         }
     )
-    buttons = [[InlineKeyboardButton("🎬 Video", callback_data="dl_video")]]
-    if allow_all:
-        buttons[0].append(
-            InlineKeyboardButton("🎵 Audio (Original)", callback_data="dl_audio")
-        )
+    buttons = [[
+        InlineKeyboardButton("🎬 Video", callback_data="dl_video"),
+        InlineKeyboardButton("🎵 Audio", callback_data="dl_audio"),
+    ]]
     await update.message.reply_text(
         "Choose your desired format:",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -917,6 +967,32 @@ async def _process_admin_wizard_message(update: Update, context: ContextTypes.DE
                 await message.reply_text(
                     f"User {target_user_id} was not found in the ban list."
                 )
+            _clear_admin_pending_state(context)
+            return True
+
+        elif action == "setrequiredchannels":
+            if step != "await_channels":
+                return await fail_and_clear("That admin action is no longer active. Please run the command again.")
+            channels_to_set_str = text_in
+            if channels_to_set_str.lower() == "none":
+                channels_to_set = []
+            else:
+                channels_to_set_raw = [ch.strip() for ch in re.split(r"[\s,;\n]+", channels_to_set_str) if ch.strip()]
+                invalid_formats = [
+                    ch for ch in channels_to_set_raw
+                    if not (ch.startswith("@") or (ch.startswith("-") and ch[1:].isdigit()) or ch.isdigit())
+                ]
+                if invalid_formats:
+                    return await fail_and_clear(
+                        f"Invalid channel formats: {', '.join(invalid_formats)}. Use @username or numeric chat ID."
+                    )
+                channels_to_set = channels_to_set_raw
+            config = await get_channel_config(context)
+            await set_channel_config(config.get("enabled", False), channels_to_set, context)
+            await message.reply_text(
+                "📢 Required channels list cleared." if not channels_to_set
+                else f"📢 Required channels set to: {', '.join(channels_to_set)}"
+            )
             _clear_admin_pending_state(context)
             return True
 
@@ -1111,18 +1187,10 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
         exp_ts = context.user_data.get("premium_expiry_timestamp")
         if exp_ts and exp_ts > datetime.datetime.now().timestamp():
             is_premium_active = True
-    can_download_audio = is_admin or is_premium_active
-    is_standard_non_privileged = role == ROLE_STANDARD and not can_download_audio
+    can_download_audio = True
+    is_standard_non_privileged = role == ROLE_STANDARD and not (is_admin or is_premium_active)
     standard_user_limit_decremented_this_attempt = False
     if is_standard_non_privileged:
-        if format_type == "audio":
-            try:
-                await query.edit_message_text(
-                    "Standard users can only download videos. /premium for audio!"
-                )
-            except TelegramError:
-                pass
-                return
         if not check_and_update_daily_limit(user_id, context):
             try:
                 await query.edit_message_text(
@@ -1484,9 +1552,13 @@ async def toggle_channel_check_impl(update: Update, context: ContextTypes.DEFAUL
 async def set_required_channels_impl(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    if not context.args:
+    if context.args:
+        # Backward-compatible support for the old one-line syntax.
+        channels_to_set_str = " ".join(context.args)
+    else:
+        _set_admin_pending_state(context, {"action": "setrequiredchannels", "step": "await_channels"})
         await update.message.reply_text(
-            "Usage: /setrequiredchannels `[@ch1 ID2...]` or `none` to clear.\nChannels must be public or bot must be admin in private channels."
+            "Send the required channels now (e.g. @channel1 -100123456789), or send `none` to clear them."
         )
         return
     channels_to_set_str = " ".join(context.args)
@@ -1845,6 +1917,9 @@ def main():
                     "enabled": False,
                     "channels": [],
                 }
+            if SUPPORT_REPLY_MAP_KEY not in app_instance.bot_data:
+                app_instance.bot_data[SUPPORT_REPLY_MAP_KEY] = {}
+            get_bot_settings(type("_Context", (), {"bot_data": app_instance.bot_data})())
             await app_instance.update_persistence()
             bot_me = await app_instance.bot.get_me()
             print(
