@@ -8,6 +8,8 @@ import traceback
 from typing import Dict, Any, Tuple, Optional, List
 from uuid import uuid4
 from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import aiohttp
 import yt_dlp
 
@@ -1427,6 +1429,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             print(
                 f"ERROR: Failed to send error message to user during error handling: {e_reply}"
             )
+# --- Render Health Server ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"NOVALY Downloader is running!")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server listening on 0.0.0.0:{port}")
+    server.serve_forever()
 
 
 def main():
@@ -1546,9 +1565,12 @@ def main():
             traceback.print_exc()
 
     application.post_init = post_initialization
+
+    # Start HTTP server for Render
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     print("Bot is starting up...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
