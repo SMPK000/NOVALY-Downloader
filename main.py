@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from copy import deepcopy
 from html import escape
 import threading
+import shutil
 import aiohttp
 import yt_dlp
 
@@ -73,8 +74,6 @@ PERSISTENCE_FILE = os.getenv(
     "PERSISTENCE_FILE",
     os.path.join(DATA_DIR, "bot_persistence.pickle") if DATA_DIR else "bot_persistence.pickle",
 )
-YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-YTDLP_COOKIES_DIR = os.getenv("YTDLP_COOKIES_DIR", "/etc/secrets").strip()
 
 ROLE_ADMIN = "admin"
 ROLE_PREMIUM = "premium"
@@ -114,7 +113,15 @@ ADMIN_WIZARD_STATE_KEY = "admin_wizard_state"
 
 MAX_RETRIES_YTDLP = 3
 RETRY_DELAY_YTDLP = 5
-USER_AGENT_YTDLP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+USER_AGENT_YTDLP = os.getenv(
+    "YTDLP_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
+YTDLP_PO_TOKEN = os.getenv("YTDLP_PO_TOKEN", "").strip()
+YTDLP_PLAYER_CLIENTS = os.getenv("YTDLP_PLAYER_CLIENTS", "").strip()
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "deno").strip()
+YTDLP_REMOTE_COMPONENTS = os.getenv("YTDLP_REMOTE_COMPONENTS", "").strip()
 
 URL_REGEX = r"(?:(?:https?|ftp):\/\/)?(?:\S+(?::\S*)?@)?(?:(?!10(?:\.\d{1,3}){3})(?!127(?:\.\d{1,3}){3})(?!169\.254(?:\.\d{1,3}){2})(?!192\.168(?:\.\d{1,3}){2})(?!172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2})(?:[1-9]\d?|1\d\d|2[01]\d|22[0-3])(?:\.(?:1?\d{1,2}|2[0-4]\d|25[0-5])){2}(?:\.(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-4]))|(?:(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)(?:\.(?:[a-z\u00a1-\uffff0-9]+-?)*[a-z\u00a1-\uffff0-9]+)*(?:\.(?:[a-z\u00a1-\uffff]{2,})))(?::\d{2,5})?(?:\/[^\s]*)?"
 TIKTOK_HOSTNAMES = ["tiktok.com", "www.tiktok.com", "vm.tiktok.com"]
@@ -206,74 +213,49 @@ def _yt_dlp_signin_hint(error_text: str) -> bool:
     ))
 
 
-def _cookie_files_for_url(url: str) -> List[str]:
-    """Return usable cookie files, preferring one complete browser export.
-
-    A single browser-exported cookies.txt can contain cookies for many domains,
-    so it is the preferred file. Additional files in Render Secret Files or
-    YTDLP_COOKIES_DIR are treated as fallbacks for platform-specific sessions.
-    """
-    candidates: List[str] = []
-
-    def add(path: str) -> None:
-        path = os.path.abspath(os.path.expanduser(path.strip())) if path else ""
-        if path and os.path.isfile(path) and os.path.getsize(path) > 0 and path not in candidates:
-            candidates.append(path)
-
-    add(YTDLP_COOKIES_FILE)
-
-    # Common Render Secret File names. Keep this broad so the same deployment
-    # can support YouTube, Instagram, TikTok, Facebook, X, Reddit, etc.
-    common_names = [
-        "cookies.txt", "youtube_cookies.txt", "instagram_cookies.txt",
-        "tiktok_cookies.txt", "facebook_cookies.txt", "x_cookies.txt",
-        "twitter_cookies.txt", "reddit_cookies.txt", "generic_cookies.txt",
-    ]
-    if YTDLP_COOKIES_DIR and os.path.isdir(YTDLP_COOKIES_DIR):
-        for name in common_names:
-            add(os.path.join(YTDLP_COOKIES_DIR, name))
-        try:
-            for name in sorted(os.listdir(YTDLP_COOKIES_DIR)):
-                if name.lower().endswith((".txt", ".cookies")) and "cookie" in name.lower():
-                    add(os.path.join(YTDLP_COOKIES_DIR, name))
-        except OSError:
-            pass
-
-    # Also support local development and a project-level cookies.txt.
-    add("cookies.txt")
-    return candidates
+def _youtube_extractor_args() -> Optional[Dict[str, Any]]:
+    """Build optional YouTube args without overriding yt-dlp's current defaults."""
+    clients = [x.strip() for x in YTDLP_PLAYER_CLIENTS.split(",") if x.strip()]
+    if not clients and not YTDLP_PO_TOKEN:
+        return None
+    yt_args: Dict[str, Any] = {}
+    if clients:
+        yt_args["player_client"] = clients
+    if YTDLP_PO_TOKEN:
+        # Accept either a complete value such as web+TOKEN or a raw token.
+        pot = YTDLP_PO_TOKEN
+        if "+" not in pot:
+            pot = f"web+{pot}"
+        yt_args["po_token"] = [pot]
+    return {"youtube": yt_args} if yt_args else None
 
 
-def _cookie_file_for_url(url: str) -> Optional[str]:
-    files = _cookie_files_for_url(url)
-    return files[0] if files else None
-
-
-def _build_ytdlp_common_opts(url: str, cookiefile: Optional[str] = None) -> Dict[str, Any]:
+def _build_ytdlp_common_opts(url: str) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "useragent": USER_AGENT_YTDLP,
         "retries": MAX_RETRIES_YTDLP,
         "fragment_retries": MAX_RETRIES_YTDLP,
+        "file_access_retries": MAX_RETRIES_YTDLP,
+        "extractor_retries": MAX_RETRIES_YTDLP,
         "socket_timeout": 45,
-        "noplaylist": False,
+        "noplaylist": True,
         "geo_bypass": True,
-        "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        "http_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
     }
-    if cookiefile and os.path.isfile(cookiefile):
-        opts["cookiefile"] = cookiefile
-    # Do not restrict normal URLs to a platform-specific extractor. yt-dlp's
-    # extractor registry + generic extractor handles a very broad range of sites.
-    lower_url = url.lower()
-    if any(host in lower_url for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["web_safari", "android_vr", "web"],
-                "skip": ["translated_subs"],
-            }
-        }
+    yt_args = _youtube_extractor_args()
+    if yt_args and any(x in (urlparse(url).hostname or "").lower() for x in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
+        opts["extractor_args"] = yt_args
+    if YTDLP_JS_RUNTIME and (YTDLP_JS_RUNTIME != "deno" or shutil.which("deno")):
+        opts["js_runtimes"] = [YTDLP_JS_RUNTIME]
+    if YTDLP_REMOTE_COMPONENTS:
+        opts["remote_components"] = [x.strip() for x in YTDLP_REMOTE_COMPONENTS.split(",") if x.strip()]
     return opts
+
 
 # --- Utility Functions ---
 # --- Utility Functions ---
@@ -321,50 +303,54 @@ async def fetch_http_content(
 def download_media_ytdlp(
     url: str, output_dir: str, format_choice: str = "video", user_id: int = 0
 ) -> Tuple[bool, str, Optional[str], Optional[Dict[str, Any]]]:
-    """Download media using yt-dlp with broad extractor + cookie fallback support."""
+    """Download public media using yt-dlp with broad extractor and YouTube fallback support."""
     os.makedirs(output_dir, exist_ok=True)
     unique_prefix = uuid4().hex[:8]
-    cookie_files = _cookie_files_for_url(url)
-    # Always try the complete browser export first, then platform-specific files,
-    # and finally a no-cookie attempt. This maximizes compatibility without
-    # requiring a separate code path for every platform yt-dlp supports.
-    cookie_attempts: List[Optional[str]] = cookie_files + [None]
 
+    # No user cookies are used. yt-dlp's native extractors, generic extractor,
+    # EJS/JS runtime, and the optional bgutil PO-token provider handle public
+    # sites without requiring the bot owner to upload a personal session.
     media_info = None
     last_error = ""
-    used_cookiefile = None
-    for cookiefile in cookie_attempts:
-        ydl_initial_info_opts = _build_ytdlp_common_opts(url, cookiefile)
+    successful_opts: Optional[Dict[str, Any]] = None
+
+    attempt_opts: List[Dict[str, Any]] = [_build_ytdlp_common_opts(url)]
+    host = (urlparse(url).hostname or "").lower()
+    if "youtube.com" in host or host.endswith("youtu.be"):
+        # Let yt-dlp choose its normal clients first. If YouTube rejects that
+        # route, try public clients that do not require account cookies.
+        for clients in (
+            ["mweb", "web_safari"],
+            ["web_embedded", "android_vr", "tv_simply"],
+        ):
+            opts = _build_ytdlp_common_opts(url)
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+            attempt_opts.append(opts)
+
+    for attempt_no, ydl_initial_info_opts in enumerate(attempt_opts, 1):
         try:
             with yt_dlp.YoutubeDL(ydl_initial_info_opts) as ydl_info_fetch:
                 media_info = ydl_info_fetch.extract_info(url, download=False)
             if media_info:
-                used_cookiefile = cookiefile
+                successful_opts = ydl_initial_info_opts
                 break
         except yt_dlp.utils.DownloadError as e:
             last_error = str(e)
             print(
-                f"INFO: yt-dlp info attempt failed (cookie={'yes' if cookiefile else 'no'}) "
+                f"INFO: yt-dlp info attempt {attempt_no}/{len(attempt_opts)} failed "
                 f"for {url} (User: {user_id}): {last_error}"
             )
-            if "unsupported url" in last_error.lower():
+            if "unsupported url" in last_error.lower() and attempt_no == len(attempt_opts):
                 return False, "Invalid or unsupported URL. yt-dlp does not recognize this link.", None, None
         except Exception as e:
             last_error = str(e)
-            print(f"INFO: yt-dlp info attempt exception for {url} (User: {user_id}): {e}")
+            print(f"INFO: yt-dlp info attempt {attempt_no}/{len(attempt_opts)} exception for {url} (User: {user_id}): {e}")
 
     if not media_info:
         if _yt_dlp_signin_hint(last_error):
-            if cookie_files:
-                return (
-                    False,
-                    "The site requires authentication/anti-bot verification. The configured cookies.txt was tried but is expired, incomplete, or not valid for this site. Refresh/export a fresh browser cookies.txt and replace the Render Secret File.",
-                    None,
-                    None,
-                )
             return (
                 False,
-                "The site requires authentication/anti-bot verification. Add a fresh browser-exported cookies.txt as a Render Secret File named cookies.txt.",
+                "This site is currently requiring authentication or anti-bot verification. NOVALY does not use a personal account cookie; yt-dlp public extraction and the configured anti-bot/PO-token helpers were tried.",
                 None,
                 None,
             )
@@ -374,13 +360,15 @@ def download_media_ytdlp(
     sanitized_title = sanitize_filename(title)
     base_filename = f"{unique_prefix}_{sanitized_title}"
 
-    ydl_download_opts: Dict[str, Any] = _build_ytdlp_common_opts(url, used_cookiefile)
+    ydl_download_opts: Dict[str, Any] = deepcopy(successful_opts or _build_ytdlp_common_opts(url))
     ydl_download_opts.update({
         "outtmpl": os.path.join(output_dir, f"{base_filename}.%(ext)s"),
         "retry_sleep_functions": {
             "http": lambda n: RETRY_DELAY_YTDLP,
             "fragment": lambda n: RETRY_DELAY_YTDLP,
         },
+        "continuedl": True,
+        "overwrites": True,
     })
     if format_choice == "video":
         # Prefer MP4-compatible streams but fall back to the best available media
@@ -456,7 +444,7 @@ def download_media_ytdlp(
         if _yt_dlp_signin_hint(err_msg):
             return (
                 False,
-                "The site requested sign-in/anti-bot verification. Refresh the browser-exported cookies.txt used by NOVALY and try again.",
+                "The site is currently requiring authentication or anti-bot verification. NOVALY uses public extraction only; yt-dlp and the configured public anti-bot/PO-token helpers were tried.",
                 None,
                 media_info,
             )
@@ -811,11 +799,8 @@ async def process_url_from_message(
         if exp_ts and exp_ts > datetime.datetime.now().timestamp():
             is_premium_active_check = True
     allow_all = is_admin_check or is_premium_active_check
-    if role == ROLE_STANDARD and not allow_all:
-        can_download, reason = await _can_standard_user_download(user_id, url, context)
-        if not can_download:
-            await update.message.reply_html(reason or "Download not allowed")
-            return
+    # Standard users have no platform restriction. Their only restrictions are
+    # the configured daily request count and file-size limit at send time.
     context.user_data.update(
         {
             "current_url_to_download": url,
@@ -1183,8 +1168,8 @@ def format_media_caption(
 ) -> str:
     if not info:
         return ""
-    title = info.get("title", "Media")
-    uploader = info.get("uploader")
+    title = escape(str(info.get("title", "Media")))
+    uploader = escape(str(info.get("uploader"))) if info.get("uploader") else None
     duration_s = info.get("duration")
     parts = []
     if title:
@@ -1293,17 +1278,10 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
                     await context.bot.send_message(
                         chat_id=query.message.chat_id,
                         text=size_err_msg,
-                        reply_to_message_id=orig_msg_id_for_reply,
                     )
                 if standard_user_limit_decremented_this_attempt:
                     revert_daily_limit_decrement(context)
             else:
-                send_action = (
-                    context.bot.send_video
-                    if format_type == "video"
-                    else context.bot.send_audio
-                )
-                media_kw = "video" if format_type == "video" else "audio"
                 try:
                     try:
                         await query.edit_message_text(
@@ -1311,34 +1289,63 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
                         )
                     except TelegramError:
                         pass
-                    with open(file_path_final, "rb") as f:
-                        await send_action(
-                            chat_id=query.message.chat_id,
-                            **{media_kw: f},
-                            caption=caption,
-                            parse_mode=constants.ParseMode.HTML,
-                            reply_to_message_id=orig_msg_id_for_reply,
-                        )
+
+                    # Telegram may reject a file as video/audio because its codec/container
+                    # is unusual even though the download itself succeeded. Try the native
+                    # media type first, then fall back to a document so the user still gets
+                    # the file instead of a generic BadRequest.
+                    send_action = context.bot.send_video if format_type == "video" else context.bot.send_audio
+                    media_kw = "video" if format_type == "video" else "audio"
+                    send_error = None
+                    try:
+                        with open(file_path_final, "rb") as f:
+                            await send_action(
+                                chat_id=query.message.chat_id,
+                                **{media_kw: f},
+                                caption=caption,
+                                parse_mode=constants.ParseMode.HTML,
+                            )
+                    except TelegramError as te:  # fallback to document for codec/container issues
+                        send_error = te
+                        print(f"WARNING: Telegram {media_kw} upload failed for {url}: {te}")
+                        with open(file_path_final, "rb") as f:
+                            await context.bot.send_document(
+                                chat_id=query.message.chat_id,
+                                document=f,
+                                caption=caption,
+                                parse_mode=constants.ParseMode.HTML,
+                            )
+
                     try:
                         await query.message.delete()
                     except TelegramError:
                         pass
                     download_successful_flag = True
                 except TelegramError as te:
-                    err_txt = f"Error sending file: {te}."
-                    if (
-                        "request entity too large" in str(te).lower()
-                        or "file is too big" in str(te).lower()
-                    ):
-                        err_txt = f"File ({file_size_mb:.2f}MB) is too large for Telegram direct upload by bots (limit ~50MB)."
+                    err_lower = str(te).lower()
+                    if "request entity too large" in err_lower or "file is too big" in err_lower:
+                        err_txt = (
+                            f"❌ The file is {file_size_mb:.2f}MB and Telegram rejected the upload as too large. "
+                            "Try a lower-quality format or a smaller source."
+                        )
+                    elif "bad request" in err_lower:
+                        err_txt = (
+                            "❌ Telegram rejected this media file. The download itself completed, "
+                            "but Telegram could not accept this container/codec."
+                        )
+                    else:
+                        err_txt = f"❌ Telegram upload failed: {te}"
+                    print(f"ERROR: Telegram upload failed for {url} (User: {user_id}): {te}")
                     try:
                         await query.edit_message_text(err_txt)
                     except TelegramError:
-                        await context.bot.send_message(
-                            chat_id=query.message.chat_id,
-                            text=err_txt,
-                            reply_to_message_id=orig_msg_id_for_reply,
-                        )
+                        try:
+                            await context.bot.send_message(
+                                chat_id=query.message.chat_id,
+                                text=err_txt,
+                            )
+                        except TelegramError:
+                            pass
                     if standard_user_limit_decremented_this_attempt:
                         revert_daily_limit_decrement(context)
         else:
@@ -1349,20 +1356,21 @@ async def download_format_callback(update: Update, context: ContextTypes.DEFAULT
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
                     text=fail_msg,
-                    reply_to_message_id=orig_msg_id_for_reply,
                 )
             if standard_user_limit_decremented_this_attempt:
                 revert_daily_limit_decrement(context)
     except Exception as e:
         print(f"ERROR: Error in download callback {url} (User: {user_id}): {e}")
-        err_msg_unexpected = f"An unexpected error occurred: {type(e).__name__}."
+        err_msg_unexpected = (
+            "❌ The download could not be completed. The error was logged for diagnosis. "
+            "Please try the link again; if it repeats, contact support."
+        )
         try:
             await query.edit_message_text(err_msg_unexpected)
         except TelegramError:
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
                 text=err_msg_unexpected,
-                reply_to_message_id=orig_msg_id_for_reply,
             )
         if (
             standard_user_limit_decremented_this_attempt
@@ -1823,9 +1831,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
                     f"WARNING: Forbidden error for user {user_id_for_error}. Bot might be blocked by this user."
                 )
                 return
-            await update.effective_message.reply_text(
-                "😔 Oops! Something went wrong on my end. Please try again or contact support if the issue persists."
-            )
+            error_text = str(context.error or "Unknown error")
+            print(f"ERROR HANDLER DETAIL: {type(context.error).__name__}: {error_text}")
+            # Do not expose stack traces or secrets, but provide a useful category.
+            if isinstance(context.error, TelegramError):
+                user_text = "❌ Telegram rejected that request. Please try the download again; if it keeps failing, contact support."
+            else:
+                user_text = "😔 Something went wrong while processing that request. Please try again or contact support."
+            await update.effective_message.reply_text(user_text)
         except Forbidden:
             print(
                 f"WARNING: Further Forbidden error while trying to send error message to user {user_id_for_error}."
@@ -1973,6 +1986,9 @@ def main():
             get_bot_settings(type("_Context", (), {"bot_data": app_instance.bot_data})())
             await app_instance.update_persistence()
             bot_me = await app_instance.bot.get_me()
+            print(f"yt-dlp version: {getattr(yt_dlp, '__version__', 'unknown')}")
+            print("Personal browser cookies: disabled (public extraction only)")
+            print(f"YouTube JS runtime configured: {bool(YTDLP_JS_RUNTIME)}; PO token configured: {bool(YTDLP_PO_TOKEN)}")
             print(
                 f"Bot commands set ({len(user_commands_list)} user commands). Bot @{bot_me.username} (ID: {bot_me.id}) started successfully!"
             )
