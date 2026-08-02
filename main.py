@@ -251,7 +251,7 @@ def _build_ytdlp_common_opts(url: str) -> Dict[str, Any]:
     if yt_args and any(x in (urlparse(url).hostname or "").lower() for x in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
         opts["extractor_args"] = yt_args
     if YTDLP_JS_RUNTIME and (YTDLP_JS_RUNTIME != "deno" or shutil.which("deno")):
-        opts["js_runtimes"] = [YTDLP_JS_RUNTIME]
+        opts["js_runtimes"] = {YTDLP_JS_RUNTIME: {}}
     if YTDLP_REMOTE_COMPONENTS:
         opts["remote_components"] = [x.strip() for x in YTDLP_REMOTE_COMPONENTS.split(",") if x.strip()]
     return opts
